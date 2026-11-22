@@ -1,0 +1,44 @@
+name: Çizgi ve Dizi - EPG Denemesi
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-epg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Deneme dosyalarını al
+        uses: actions/checkout@v4
+
+      - name: Node.js 22 kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: IPTV-org EPG kodunu al
+        run: git clone --depth 1 https://github.com/iptv-org/epg.git iptv-epg
+
+      - name: Bağımlılıkları yükle
+        working-directory: iptv-epg
+        run: npm ci
+
+      - name: Altı kanaldan iki günlük yayın akışını çek
+        working-directory: iptv-epg
+        run: |
+          npm run grab -- --channels="$GITHUB_WORKSPACE/channels.xml" --days=2 --maxConnections=2 --output="$GITHUB_WORKSPACE/guide.xml"
+
+      - name: XML içindeki gerçek programları say
+        run: python3 scripts/report.py guide.xml
+
+      - name: XML sonucunu indirilebilir olarak sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epg-test-xml
+          path: guide.xml
+          if-no-files-found: warn
+          retention-days: 7
