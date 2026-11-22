@@ -1,4 +1,4 @@
-name: Çizgi ve Dizi - EPG Denemesi
+name: Çizgi ve Dizi - VIMN XML Denemesi
 
 on:
   workflow_dispatch:
@@ -9,36 +9,100 @@ permissions:
 jobs:
   test-epg:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
-      - name: Deneme dosyalarını al
-        uses: actions/checkout@v4
-
-      - name: Node.js 22 kur
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: IPTV-org EPG kodunu al
-        run: git clone --depth 1 https://github.com/iptv-org/epg.git iptv-epg
-
-      - name: Bağımlılıkları yükle
-        working-directory: iptv-epg
-        run: npm ci
-
-      - name: Altı kanaldan iki günlük yayın akışını çek
-        working-directory: iptv-epg
+      - name: Paramount VIMN kaynaklarından günlük XML dosyalarını kontrol et
+        shell: bash
         run: |
-          npm run grab -- --channels="$GITHUB_WORKSPACE/channels.xml" --days=2 --maxConnections=2 --output="$GITHUB_WORKSPACE/guide.xml"
+          python3 - <<'PY'
+          from collections import Counter
+          from datetime import datetime, timedelta
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+          from xml.etree import ElementTree as ET
+          from zoneinfo import ZoneInfo
 
-      - name: XML içindeki gerçek programları say
-        run: python3 scripts/report.py guide.xml
+          SOURCES = {
+              "Nickelodeon": "https://epg.vimn.com/nickelodeon_global/xmltvlegal/tur/",
+              "Nick Jr.": "https://epg.vimn.com/nick_jr_global/xmltvlegal/tur/",
+              "Nicktoons": "https://epg.vimn.com/nicktoons_global/xmltvlegal/tur/",
+          }
 
-      - name: XML sonucunu indirilebilir olarak sakla
+          class XMLLinks(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.names = set()
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "a":
+                      for key, value in attrs:
+                          if key.lower() == "href" and value:
+                              self.names.add(value.split("?")[0].rstrip("/").rsplit("/", 1)[-1])
+
+          def download(url):
+              request = Request(url, headers={"User-Agent": "CizgiVeDiziEPG/1.0 (GitHub Actions; XML test)", "Accept": "text/html, application/xml, text/xml, */*"})
+              with urlopen(request, timeout=20) as response:
+                  return response.read(5_000_000)
+
+          def local_tag(element):
+              return element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else "?"
+
+          today = datetime.now(ZoneInfo("Europe/Istanbul")).date()
+          dates = [today, today + timedelta(days=1)]
+          total_files = total_programmes = 0
+          output = Path("vimn-xml")
+
+          for channel, base in SOURCES.items():
+              print(f"\n=== {channel} ===", flush=True)
+              try:
+                  listing = XMLLinks()
+                  listing.feed(download(base).decode("utf-8", errors="replace"))
+              except (HTTPError, URLError, TimeoutError, OSError) as error:
+                  print(f"Dizin okunamadı: {error}")
+                  continue
+
+              for day in dates:
+                  filename = day.strftime("%Y%m%d") + ".xml"
+                  if filename not in listing.names:
+                      print(f"{day}: dizinde dosya yok (atlandı)")
+                      continue
+                  try:
+                      raw = download(base + filename)
+                      root = ET.fromstring(raw)
+                  except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError) as error:
+                      print(f"{day}: XML indirilemedi/okunamadı: {error}")
+                      continue
+
+                  destination = output / channel.replace(" ", "_") / filename
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(raw)
+                  total_files += 1
+                  programs = [node for node in root.iter() if local_tag(node).lower() == "programme"]
+                  total_programmes += len(programs)
+                  print(f"{day}: indirildi ({len(raw)} bayt), XML kökü: {local_tag(root)}, program: {len(programs)}")
+                  if programs:
+                      sample = programs[0]
+                      title = next((node.text for node in sample.iter() if local_tag(node).lower() == "title" and node.text), "(başlık yok)")
+                      print(f"  Örnek: {sample.get('start', '(saat yok)')} | {title}")
+                  else:
+                      counts = Counter(local_tag(node) for node in root.iter())
+                      print(f"  XML etiketlerinden örnek: {counts.most_common(8)}")
+                      print("  Not: XMLTV <programme> kullanılmıyorsa ayrı dönüştürücü gerekiyor.")
+
+          print(f"\nSONUÇ: {total_files} XML dosyası, {total_programmes} XMLTV program kaydı")
+          if total_files == 0:
+              raise SystemExit("HATA: Hiç XML indirilemedi. Kaynak erişimi kontrol edilmeli.")
+          if total_programmes == 0:
+              print("UYARI: Dosyalar var ama <programme> yok; önce dosya yapısı incelenmeli.")
+          PY
+
+      - name: İndirilen XML dosyalarını sonuç olarak ekle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: epg-test-xml
-          path: guide.xml
+          name: vimn-xml-deneme
+          path: vimn-xml/
           if-no-files-found: warn
           retention-days: 7
