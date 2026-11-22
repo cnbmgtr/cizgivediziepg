@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<channels>
+  <channel site="dsmart.com.tr" site_id="58d29bb0eefad3db9c6062c8" lang="tr" xmltv_id="CartoonNetwork.tr@SD">Cartoon Network</channel>
+  <channel site="dsmart.com.tr" site_id="58d29bb0eefad3db9c6062b9" lang="tr" xmltv_id="Cartoonito.uk@SD">Cartoonito</channel>
+  <channel site="dsmart.com.tr" site_id="5fedddcecfef0b159330996e" lang="tr" xmltv_id="DisneyJr.tr@SD">Disney Junior</channel>
+  <channel site="digiturk.com.tr" site_id="243" lang="tr" xmltv_id="TRTCocuk.tr@SD">TRT Çocuk</channel>
+  <channel site="digiturk.com.tr" site_id="189" lang="tr" xmltv_id="Nickelodeon.tr@SD">Nickelodeon</channel>
+  <channel site="digiturk.com.tr" site_id="321" lang="tr" xmltv_id="NickJr.tr@SD">Nick Jr.</channel>
+</channels>
