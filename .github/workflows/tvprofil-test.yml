@@ -1,0 +1,127 @@
+name: TvProfil - Tek Tarih EPG Testi
+
+'on':
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Yayın tarihi (YYYY-MM-DD)'
+        required: true
+        default: '2026-10-19'
+        type: string
+      channel:
+        description: 'TvProfil kanal kodu'
+        required: true
+        default: 'boomerang-tr'
+        type: string
+
+jobs:
+  test-tvprofil:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Kanal ve tarih icin TvProfil testini yap
+        env:
+          GUIDE_DATE: ${{ inputs.date }}
+          GUIDE_CHANNEL: ${{ inputs.channel }}
+        run: |
+          python -m pip install --disable-pip-version-check beautifulsoup4 requests
+          python - <<'PY'
+          import os, re, json, sys
+          from datetime import datetime, timedelta, timezone
+          from urllib.parse import urlencode
+          import xml.etree.ElementTree as ET
+          import requests
+          from bs4 import BeautifulSoup
+
+          date = os.environ['GUIDE_DATE']
+          channel = os.environ['GUIDE_CHANNEL']
+          datetime.strptime(date, '%Y-%m-%d')
+          if not re.fullmatch(r'[a-zA-Z0-9_-]+', channel):
+              raise ValueError('Gecersiz kanal kodu')
+
+          # TvProfil'in IPTV-org EPG projesinde belgelenen sorgu yapisi.
+          c = 4
+          a = date + channel + str(c)
+          for ch in channel + date:
+              c += ord(ch)
+          b = 2
+          for i in range(len(a)-1, -1, -1):
+              b += (ord(a[i]) + c*2)*i
+          last = str(b)[-1]
+          # JS: son karakterin ASCII kodu; rakam '0' icin 48, '9' icin 57
+          suffix = ord(last)
+          params = {'datum': date, 'kanal': channel,
+                    'callback': f'tvprogramit{suffix}', f'b{suffix}': str(b)}
+          url = 'https://tvprofil.com/tr/tv-rehberi/program/?' + urlencode(params)
+          headers = {
+              'X-Requested-With': 'XMLHttpRequest',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36',
+              'Referer': 'https://tvprofil.com/tr/tvschedule/',
+              'Accept': 'text/javascript, application/javascript, application/ecmascript, application/x-ecmascript, */*; q=0.01',
+          }
+          report = [f'Kanal: {channel}', f'Tarih: {date}']
+          ok = False
+          try:
+              response = requests.get(url, headers=headers, timeout=30)
+              report += [f'HTTP: {response.status_code}', f'Yanit boyutu: {len(response.content)} bayt']
+              response.raise_for_status()
+              body = response.text.strip()
+              left, right = body.find('('), body.rfind(')')
+              if left < 1 or right <= left:
+                  raise ValueError('JSONP biciminde yanit yok; site kodu degismis olabilir')
+              payload = json.loads(body[left+1:right])
+              fragment = (payload.get('data') or {}).get('program') or ''
+              soup = BeautifulSoup(fragment, 'html.parser')
+              rows = soup.select('div.row[data-ts][data-len]')
+              root = ET.Element('tv', {'generator-info-name': 'TvProfil-Tek-Gun-Test'})
+              ET.SubElement(root, 'channel', {'id': channel}).append(ET.Element('display-name'))
+              root.find('channel/display-name').text = channel
+              entries = []
+              for row in rows:
+                  second = row.select_one('.col:nth-child(2)')
+                  if not second:
+                      continue
+                  anchor = second.select_one('a')
+                  title = (anchor.get_text(' ', strip=True) if anchor else '')
+                  title += ' ' + ' '.join(str(t).strip() for t in second.find_all(string=True, recursive=False))
+                  title = title.replace('®', '').strip().rstrip(',')
+                  if not title:
+                      continue
+                  start_seconds = int(row['data-ts'])
+                  duration = int(row['data-len'])
+                  if duration <= 0:
+                      continue
+                  fmt = lambda seconds: datetime.fromtimestamp(seconds, timezone.utc).strftime('%Y%m%d%H%M%S +0000')
+                  p = ET.SubElement(root, 'programme', {
+                      'channel': channel, 'start': fmt(start_seconds),
+                      'stop': fmt(start_seconds + duration)})
+                  ET.SubElement(p, 'title', {'lang': 'tr'}).text = title
+                  entries.append((start_seconds, title))
+              ET.indent(root)
+              ET.ElementTree(root).write('tvprofil-deneme.xml', encoding='utf-8', xml_declaration=True)
+              report.append(f'Gercek program sayisi: {len(entries)}')
+              for seconds, title in entries[:10]:
+                  tr_time = datetime.fromtimestamp(seconds, timezone(timedelta(hours=3)))
+                  report.append(f'  {tr_time:%d.%m.%Y %H:%M} | {title}')
+              if not entries:
+                  report.append('UYARI: 0 program; bu tarih icin arsiv erisimi dogrulanamadi.')
+              ok = bool(entries)
+          except Exception as exc:
+              report.append(f'HATA: {type(exc).__name__}: {exc}')
+              report.append('Kaynak erisimi veya formatini manuel incelemek gerekebilir.')
+          finally:
+              with open('tvprofil-sonuc.txt', 'w', encoding='utf-8') as f:
+                  f.write('\n'.join(report) + '\n')
+              print('\n'.join(report))
+              if not ok:
+                  sys.exit(1)
+          PY
+      - name: Sonuc dosyalarini sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tvprofil-tek-tarih-deneme
+          path: |
+            tvprofil-sonuc.txt
+            tvprofil-deneme.xml
+          if-no-files-found: warn
