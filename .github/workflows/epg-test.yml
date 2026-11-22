@@ -1,4 +1,4 @@
-name: Çizgi ve Dizi - VIMN XML Denemesi
+name: Çizgi ve Dizi - VIMN Tüm Tarihler (TR + EN)
 
 on:
   workflow_dispatch:
@@ -9,100 +9,210 @@ permissions:
 jobs:
   test-epg:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 180
     steps:
-      - name: Paramount VIMN kaynaklarından günlük XML dosyalarını kontrol et
+      - name: Nickelodeon, Nicktoons ve Nick Jr. için Türkçe ve İngilizce bütün tarihleri indir
         shell: bash
         run: |
           python3 - <<'PY'
-          from collections import Counter
-          from datetime import datetime, timedelta
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime
           from html.parser import HTMLParser
           from pathlib import Path
           from urllib.error import HTTPError, URLError
+          from urllib.parse import unquote, urljoin, urlsplit
           from urllib.request import Request, urlopen
+          import csv
+          import os
+          import re
+          import time
           from xml.etree import ElementTree as ET
-          from zoneinfo import ZoneInfo
 
-          SOURCES = {
-              "Nickelodeon": "https://epg.vimn.com/nickelodeon_global/xmltvlegal/tur/",
-              "Nick Jr.": "https://epg.vimn.com/nick_jr_global/xmltvlegal/tur/",
-              "Nicktoons": "https://epg.vimn.com/nicktoons_global/xmltvlegal/tur/",
+          # Kullanıcının verdiği EPG kaynakları. Tarih veya gün sınırı YOK.
+          HOSTS = ('https://epgs.vimn.com', 'https://epg.vimn.com')
+          CHANNELS = {
+              'Nickelodeon': 'nickelodeon_global',
+              'Nicktoons': 'nicktoons_global',
+              'Nick_Jr': 'nick_jr_global',
           }
+          LANGUAGES = ('tur', 'eng')
+          OUTPUT = Path('vimn-xml')
+          MAX_FILE_BYTES = 15_000_000
+          MAX_WORKERS = 4  # Kaynak sunucuyu fazla zorlamamak için
 
-          class XMLLinks(HTMLParser):
+          class FileLinks(HTMLParser):
               def __init__(self):
                   super().__init__()
-                  self.names = set()
+                  self.urls = []
 
               def handle_starttag(self, tag, attrs):
-                  if tag.lower() == "a":
+                  if tag.lower() == 'a':
                       for key, value in attrs:
-                          if key.lower() == "href" and value:
-                              self.names.add(value.split("?")[0].rstrip("/").rsplit("/", 1)[-1])
+                          if key.lower() == 'href' and value:
+                              self.urls.append(value)
 
-          def download(url):
-              request = Request(url, headers={"User-Agent": "CizgiVeDiziEPG/1.0 (GitHub Actions; XML test)", "Accept": "text/html, application/xml, text/xml, */*"})
-              with urlopen(request, timeout=20) as response:
-                  return response.read(5_000_000)
 
-          def local_tag(element):
-              return element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else "?"
-
-          today = datetime.now(ZoneInfo("Europe/Istanbul")).date()
-          dates = [today, today + timedelta(days=1)]
-          total_files = total_programmes = 0
-          output = Path("vimn-xml")
-
-          for channel, base in SOURCES.items():
-              print(f"\n=== {channel} ===", flush=True)
-              try:
-                  listing = XMLLinks()
-                  listing.feed(download(base).decode("utf-8", errors="replace"))
-              except (HTTPError, URLError, TimeoutError, OSError) as error:
-                  print(f"Dizin okunamadı: {error}")
-                  continue
-
-              for day in dates:
-                  filename = day.strftime("%Y%m%d") + ".xml"
-                  if filename not in listing.names:
-                      print(f"{day}: dizinde dosya yok (atlandı)")
-                      continue
+          def get_bytes(url, retries=3, limit=MAX_FILE_BYTES):
+              for attempt in range(retries):
                   try:
-                      raw = download(base + filename)
-                      root = ET.fromstring(raw)
-                  except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError) as error:
-                      print(f"{day}: XML indirilemedi/okunamadı: {error}")
-                      continue
+                      request = Request(url, headers={
+                          'User-Agent': 'CizgiVeDiziEPG/1.0 (GitHub Actions; XML archive)',
+                          'Accept': 'text/html, application/xml, text/xml, */*',
+                      })
+                      with urlopen(request, timeout=35) as resp:
+                          raw = resp.read(limit + 1)
+                          if len(raw) > limit:
+                              raise ValueError(f'Dosya boyutu {limit} bayt sınırını aşıyor')
+                          return raw
+                  except HTTPError as error:
+                      if error.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
+                          raise
+                      wait = error.headers.get('Retry-After', '')
+                      time.sleep(min(30, int(wait)) if wait.isdigit() else 2 * (attempt + 1))
+                  except (URLError, TimeoutError, ConnectionError, OSError) as error:
+                      if attempt == retries - 1:
+                          raise
+                      time.sleep(2 * (attempt + 1))
+              raise RuntimeError('İndirme denemeleri başarısız')
 
-                  destination = output / channel.replace(" ", "_") / filename
+
+          def list_all_dates(channel_key, language):
+              problems = []
+              for host in HOSTS:
+                  base = f'{host}/{CHANNELS[channel_key]}/xmltvlegal/{language}/'
+                  try:
+                      page = get_bytes(base, limit=8_000_000).decode('utf-8', errors='replace')
+                      parser = FileLinks()
+                      parser.feed(page)
+                      found = {}
+                      for href in parser.urls:
+                          full = urljoin(base, href)
+                          parsed = urlsplit(full)
+                          # Yalnızca beklenen dizindeki tarihli XML'leri al.
+                          if parsed.netloc != urlsplit(base).netloc:
+                              continue
+                          path, _, filename = unquote(parsed.path).rpartition('/')
+                          if path.rstrip('/') != urlsplit(base).path.rstrip('/'):
+                              continue
+                          if not re.fullmatch(r'\d{8}\.xml', filename):
+                              continue
+                          try:
+                              datetime.strptime(filename[:8], '%Y%m%d')
+                          except ValueError:
+                              continue
+                          found[filename[:8]] = full
+                      if found:
+                          print(f'{channel_key}/{language}: dizinde {len(found)} tarih bulundu ({host})', flush=True)
+                          return found
+                      problems.append(f'{host}: dizinde tarihli XML bağlantısı bulunamadı')
+                  except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+                      problems.append(f'{host}: {error}')
+              raise RuntimeError('; '.join(problems))
+
+
+          def save_xml(channel_key, language, date, url):
+              destination = OUTPUT / channel_key / language / f'{date}.xml'
+              try:
+                  content = get_bytes(url)
+                  root = ET.fromstring(content)
+                  if root.tag.rsplit('}', 1)[-1].lower() != 'tv':
+                      raise ValueError(f'Beklenmeyen XML kökü: {root.tag}')
+                  programmes = sum(1 for element in root.iter() if isinstance(element.tag, str)
+                                   and element.tag.rsplit('}', 1)[-1] == 'programme')
                   destination.parent.mkdir(parents=True, exist_ok=True)
-                  destination.write_bytes(raw)
-                  total_files += 1
-                  programs = [node for node in root.iter() if local_tag(node).lower() == "programme"]
-                  total_programmes += len(programs)
-                  print(f"{day}: indirildi ({len(raw)} bayt), XML kökü: {local_tag(root)}, program: {len(programs)}")
-                  if programs:
-                      sample = programs[0]
-                      title = next((node.text for node in sample.iter() if local_tag(node).lower() == "title" and node.text), "(başlık yok)")
-                      print(f"  Örnek: {sample.get('start', '(saat yok)')} | {title}")
-                  else:
-                      counts = Counter(local_tag(node) for node in root.iter())
-                      print(f"  XML etiketlerinden örnek: {counts.most_common(8)}")
-                      print("  Not: XMLTV <programme> kullanılmıyorsa ayrı dönüştürücü gerekiyor.")
+                  destination.write_bytes(content)
+                  return (channel_key, language, date, programmes, len(content), 'OK', url, '')
+              except (HTTPError, URLError, TimeoutError, OSError, ValueError, ET.ParseError) as error:
+                  return (channel_key, language, date, 0, 0, 'HATA', url, str(error))
 
-          print(f"\nSONUÇ: {total_files} XML dosyası, {total_programmes} XMLTV program kaydı")
-          if total_files == 0:
-              raise SystemExit("HATA: Hiç XML indirilemedi. Kaynak erişimi kontrol edilmeli.")
-          if total_programmes == 0:
-              print("UYARI: Dosyalar var ama <programme> yok; önce dosya yapısı incelenmeli.")
+
+          def run():
+              OUTPUT.mkdir(parents=True, exist_ok=True)
+              jobs = []
+              source_summary = []
+              errors = []
+              print('VIMN: 3 kanal x 2 dil. Dizinlerdeki TÜM tarihler taranıyor.', flush=True)
+              for channel in CHANNELS:
+                  for language in LANGUAGES:
+                      try:
+                          dates = list_all_dates(channel, language)
+                          source_summary.append((channel, language, len(dates)))
+                          jobs.extend((channel, language, date, url) for date, url in sorted(dates.items()))
+                      except RuntimeError as error:
+                          print(f'HATA {channel}/{language}: {error}', flush=True)
+                          errors.append(f'{channel}/{language}: {error}')
+                          source_summary.append((channel, language, 0))
+
+              print(f'Toplam {len(jobs)} XML dosyası indirilmeye çalışılacak.', flush=True)
+              results = []
+              if jobs:
+                  with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                      futures = [executor.submit(save_xml, *job) for job in jobs]
+                      for index, future in enumerate(as_completed(futures), 1):
+                          result = future.result()
+                          results.append(result)
+                          if result[5] != 'OK':
+                              print(f'HATA {result[0]}/{result[1]}/{result[2]}: {result[7]}', flush=True)
+                          if index % 25 == 0 or index == len(jobs):
+                              ok = sum(row[5] == 'OK' for row in results)
+                              print(f'İlerleme: {index}/{len(jobs)} dosya kontrol edildi; {ok} başarılı', flush=True)
+
+              results.sort(key=lambda row: (row[0], row[1], row[2]))
+              manifest = OUTPUT / 'manifest.csv'
+              with manifest.open('w', encoding='utf-8-sig', newline='') as handle:
+                  writer = csv.writer(handle)
+                  writer.writerow(('kanal', 'dil', 'tarih', 'program_sayisi', 'bayt', 'durum', 'kaynak', 'hata'))
+                  writer.writerows(results)
+
+              ok_results = [result for result in results if result[5] == 'OK']
+              failed = [result for result in results if result[5] != 'OK']
+              total_programmes = sum(result[3] for result in ok_results)
+              lines = [
+                  '# Çizgi ve Dizi – Paramount XML arşivi',
+                  '',
+                  'Dizinlerde listelenen tarihler tarandı; geçmiş ve gelecekteki bütün mevcut XML dosyaları hedeflendi.',
+                  'Türkçe (`tur`) ve İngilizce (`eng`) dosyalar ayrı saklandı.',
+                  'Kaynak listesinde bulunmayan tarihler indirilemez.',
+                  '',
+                  '| Kanal | Dil | Listelenen tarihler | İndirilen XML | Program kaydı |',
+                  '|---|---|---:|---:|---:|',
+              ]
+              for channel, language, listed in source_summary:
+                  subset = [row for row in ok_results if row[0] == channel and row[1] == language]
+                  lines.append(f'| {channel} | {language} | {listed} | {len(subset)} | {sum(row[3] for row in subset)} |')
+              lines.extend([
+                  '',
+                  f'**Toplam: {len(ok_results)} XML, {total_programmes} program kaydı.**',
+                  f'Başarısız dosya: {len(failed)}; erişilemeyen dizin: {len(errors)}.',
+                  '',
+                  'Not: `programme` sayıları iki dilde aynı yayınların tekrarlarını içerebilir.',
+                  'Bu çıktı GitHub Actions artifact olarak geçici saklanır; kalıcı arşiv değildir.',
+              ])
+              if errors:
+                  lines.extend(['', '## Erişilemeyen dizinler'] + [f'- {error}' for error in errors])
+              if failed:
+                  lines.extend(['', '## Hatalı dosyalardan ilk 20 kayıt'] +
+                               [f'- {row[0]}/{row[1]}/{row[2]}: {row[7]}' for row in failed[:20]])
+              report = '\n'.join(lines) + '\n'
+              (OUTPUT / 'RAPOR.md').write_text(report, encoding='utf-8')
+              print(report, flush=True)
+              summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary_path:
+                  with open(summary_path, 'a', encoding='utf-8') as handle:
+                      handle.write(report)
+              if errors or failed or not ok_results:
+                  raise SystemExit('Arşiv tamamlanamadı: ayrıntılar RAPOR.md ve manifest.csv içinde. Başarılı dosyalar yine yüklenir.')
+
+
+          if __name__ == '__main__':
+              run()
           PY
 
-      - name: İndirilen XML dosyalarını sonuç olarak ekle
+      - name: İndirilen bütün XML arşivlerini çıktı olarak ekle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vimn-xml-deneme
+          name: vimn-tum-tarihler-tur-eng
           path: vimn-xml/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 90
